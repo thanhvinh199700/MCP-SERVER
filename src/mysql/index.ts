@@ -8,11 +8,11 @@ import {
   ListToolsRequestSchema,
   ReadResourceRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import pg from "pg";
+import mysql from 'mysql2/promise';
 
 const server = new Server(
   {
-    name: "example-servers/postgres",
+    name: "example-servers/mysql",
     version: "0.1.0",
   },
   {
@@ -24,38 +24,32 @@ const server = new Server(
 );
 
 const args = process.argv.slice(2);
-if (args.length === 0) {
-  console.error("Please provide a database URL as a command-line argument");
-  process.exit(1);
-}
-
-const databaseUrl = args[0];
+const databaseUrl = args.length > 0 ? args[0] : 'mysql://magento:magento@localhost:3306/magento?charset=utf8';
 
 const resourceBaseUrl = new URL(databaseUrl);
-resourceBaseUrl.protocol = "postgres:";
+resourceBaseUrl.protocol = "mysql:";
 resourceBaseUrl.password = "";
 
-const pool = new pg.Pool({
-  connectionString: databaseUrl,
-});
+// Create MySQL pool connection
+const pool = mysql.createPool(databaseUrl);
 
 const SCHEMA_PATH = "schema";
 
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const client = await pool.connect();
+  const connection = await pool.getConnection();
   try {
-    const result = await client.query(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+    const [result] = await connection.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()"
     );
     return {
-      resources: result.rows.map((row) => ({
-        uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href,
+      resources: (result as any[]).map((row) => ({
+        uri: new URL(`${row.TABLE_NAME}/${SCHEMA_PATH}`, resourceBaseUrl).href,
         mimeType: "application/json",
-        name: `"${row.table_name}" database schema`,
+        name: `"${row.TABLE_NAME}" database schema`,
       })),
     };
   } finally {
-    client.release();
+    connection.release();
   }
 });
 
@@ -70,11 +64,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     throw new Error("Invalid resource URI");
   }
 
-  const client = await pool.connect();
+  const connection = await pool.getConnection();
   try {
-    const result = await client.query(
-      "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1",
-      [tableName],
+    const [result] = await connection.query(
+      "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = ?",
+      [tableName]
     );
 
     return {
@@ -82,12 +76,12 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         {
           uri: request.params.uri,
           mimeType: "application/json",
-          text: JSON.stringify(result.rows, null, 2),
+          text: JSON.stringify(result, null, 2),
         },
       ],
     };
   } finally {
-    client.release();
+    connection.release();
   }
 });
 
@@ -112,24 +106,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "query") {
     const sql = request.params.arguments?.sql as string;
 
-    const client = await pool.connect();
+    const connection = await pool.getConnection();
     try {
-      await client.query("BEGIN TRANSACTION READ ONLY");
-      const result = await client.query(sql);
+      await connection.beginTransaction();
+      const [result] = await connection.query(sql);
       return {
-        content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         isError: false,
       };
     } catch (error) {
       throw error;
     } finally {
-      client
-        .query("ROLLBACK")
-        .catch((error) =>
-          console.warn("Could not roll back transaction:", error),
-        );
-
-      client.release();
+      try {
+        await connection.rollback();
+      } catch (error) {
+        console.warn("Could not roll back transaction:", error);
+      }
+      connection.release();
     }
   }
   throw new Error(`Unknown tool: ${request.params.name}`);
